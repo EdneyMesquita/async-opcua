@@ -309,7 +309,13 @@ pub(crate) async fn activate_session(
     let security_policy = channel.security_policy();
     let security_mode = channel.security_mode();
     let secure_channel_id = channel.secure_channel_id();
-    let server_nonce = security_policy.random_nonce();
+    // Part 4 (ActivateSession): the serverNonce is a random number of at least 32 bytes, whatever the
+    // SecurityPolicy. `SecurityPolicy::random_nonce` is the channel nonce, which is null for `None`; strict
+    // clients (open62541) reject a null or short serverNonce with BadSecurityChecksFailed.
+    let server_nonce = {
+        let mgr = trace_read_lock!(mgr_lck);
+        random::byte_string(mgr.info.config.session_nonce_length.max(32))
+    };
     let (endpoint_url, session_nonce, session_lck, info) = {
         let mgr = trace_read_lock!(mgr_lck);
         let Some(session_lck) = mgr.find_by_token(&request.request_header.authentication_token)
