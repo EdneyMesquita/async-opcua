@@ -1,6 +1,10 @@
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
-use opcua_core::{comms::url::is_opc_ua_binary_url, config::Config, sync::RwLock};
+use opcua_core::{
+    comms::{tap::MessageTap, url::is_opc_ua_binary_url},
+    config::Config,
+    sync::RwLock,
+};
 use opcua_crypto::{CertificateStore, SecurityPolicy};
 use opcua_types::{
     ContextOwned, EndpointDescription, Error, MessageSecurityMode, NamespaceMap, NodeId,
@@ -22,6 +26,7 @@ struct SessionBuilderInner {
     session_id: Option<NodeId>,
     user_identity_token: IdentityToken,
     type_loaders: Vec<Arc<dyn TypeLoader>>,
+    message_tap: Option<Arc<dyn MessageTap>>,
 }
 
 /// Trait for getting a connection builder for a given endpoint.
@@ -137,6 +142,7 @@ impl<'a> SessionBuilder<'a, (), (), DirectConnectionSource> {
                 session_id: None,
                 user_identity_token: IdentityToken::Anonymous,
                 type_loaders: Vec::new(),
+                message_tap: None,
             },
             connection_source: DirectConnectionSource,
         }
@@ -181,6 +187,18 @@ impl<'a, T, R, C> SessionBuilder<'a, T, R, C> {
     /// are fetched from the server.
     pub fn type_loader(mut self, type_loader: Arc<dyn TypeLoader>) -> Self {
         self.inner.type_loaders.push(type_loader);
+        self
+    }
+
+    /// Install a [`MessageTap`] that observes every plaintext message chunk sent and received
+    /// on the session's secure channel, including `OpenSecureChannel` and
+    /// `CloseSecureChannel`, also when the channel is signed and encrypted.
+    ///
+    /// The tap is kept across reconnects. It is not used for the temporary connections
+    /// the [`Client`] makes to list endpoints. See [`MessageTap`] for what it receives and
+    /// the requirements on the implementation.
+    pub fn message_tap(mut self, tap: Arc<dyn MessageTap>) -> Self {
+        self.inner.message_tap = Some(tap);
         self
     }
 
@@ -412,6 +430,7 @@ where
                 self.endpoint,
                 self.config,
                 ctx,
+                self.inner.message_tap,
             ),
             self.config.session_name.clone().into(),
             self.config.application_description(),
@@ -442,6 +461,7 @@ where
         endpoint: EndpointDescription,
         config: &ClientConfig,
         ctx: ContextOwned,
+        message_tap: Option<Arc<dyn MessageTap>>,
     ) -> AsyncSecureChannel {
         AsyncSecureChannel::new(
             certificate_store,
@@ -458,6 +478,7 @@ where
                 recv_buffer_size: config.decoding_options.max_incoming_chunk_size,
                 max_message_size: config.decoding_options.max_message_size,
                 max_chunk_count: config.decoding_options.max_chunk_count,
+                message_tap,
             },
             config.channel_lifetime,
             Arc::new(RwLock::new(ctx)),
@@ -477,6 +498,7 @@ where
             self.endpoint,
             self.config,
             ctx,
+            self.inner.message_tap,
         ))
     }
 }

@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use futures::future::Either;
 use opcua_core::comms::sequence_number::SequenceNumberHandle;
+use opcua_core::comms::tap::{MessageTap, TapDirection, TappedChunk};
 use opcua_core::{trace_read_lock, RequestMessage, ResponseMessage};
 use tracing::{debug, error, trace, warn};
 
@@ -46,6 +47,8 @@ pub struct TransportState {
     /// Max size of incoming chunks
     #[allow(unused)]
     receive_buffer_size: usize,
+    /// Optional observer of incoming plaintext chunks.
+    tap: Option<Arc<dyn MessageTap>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,7 +107,17 @@ impl TransportState {
             sequence_numbers: SequenceNumberHandle::new(legacy_sequence_numbers),
             max_chunk_count,
             receive_buffer_size,
+            tap: None,
         }
+    }
+
+    /// Set a [`MessageTap`] that is shown every incoming chunk after it has been decrypted
+    /// and verified, or remove it with `None`.
+    ///
+    /// To also tap outgoing chunks, set the same tap on the transport's
+    /// [`SendBuffer`] with [`SendBuffer::set_message_tap`].
+    pub fn set_message_tap(&mut self, tap: Option<Arc<dyn MessageTap>>) {
+        self.tap = tap;
     }
 
     /// Wait for an outgoing message. Will also check for timed out messages.
@@ -227,6 +240,13 @@ impl TransportState {
             let decoding_options = secure_channel.decoding_options();
             (chunk, chunk_info, decoding_options)
         };
+        if let Some(tap) = &self.tap {
+            tap.on_chunk(&TappedChunk::new(
+                TapDirection::Receive,
+                &chunk,
+                &chunk_info,
+            ));
+        }
         let req_id = chunk_info.sequence_header.request_id;
 
         self.sequence_numbers

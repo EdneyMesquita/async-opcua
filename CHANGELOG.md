@@ -4,9 +4,23 @@
 
 ### Client
 
+#### Added
+
+ - Added `SessionBuilder::message_tap` and `TransportConfiguration::message_tap`, which install a `MessageTap` that observes the plaintext message chunks sent and received on the secure channel, with their real sequence numbers and request ids, also when the channel is signed and encrypted. Nothing changes when no tap is installed.
+
+#### Changed
+
+ - `TransportConfiguration` has a new public field `message_tap`. Code that constructs it with a struct literal must set it, to `None` for no tap. Custom `Connector` implementations that do not use `StreamConnector` can install the tap with `TransportState::set_message_tap` and `SendBuffer::set_message_tap`.
+
 #### Fixed
 
  - Publishing now resumes after a reconnect that recreates the subscriptions, for example after the server restarted. The subscription event loop previously started out believing there were no subscriptions, and ignored publish triggers fired while reconnecting, so it never sent another `Publish` request. ([#270](https://github.com/FreeOpcUa/async-opcua/issues/270))
+
+### Common
+
+#### Added
+
+ - Added `opcua_core::comms::tap` with the `MessageTap` trait, `TappedChunk` and `TapDirection`, and `SendBuffer::set_message_tap`.
 
 ### Server
 

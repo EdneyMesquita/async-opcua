@@ -205,13 +205,17 @@ where
             ack.max_chunk_count as usize,
         );
 
+        buffer.set_message_tap(config.message_tap.clone());
+        let mut state = TransportState::new(
+            channel,
+            outgoing_recv,
+            config.max_chunk_count,
+            ack.send_buffer_size.min(config.recv_buffer_size as u32) as usize,
+        );
+        state.set_message_tap(config.message_tap);
+
         Ok(StreamTransport {
-            state: TransportState::new(
-                channel,
-                outgoing_recv,
-                config.max_chunk_count,
-                ack.send_buffer_size.min(config.recv_buffer_size as u32) as usize,
-            ),
+            state,
             read: connection.reader,
             write: connection.writer,
             send_buffer: buffer,

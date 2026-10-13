@@ -4,6 +4,7 @@
 use std::{
     collections::VecDeque,
     io::{BufRead, Cursor},
+    sync::Arc,
 };
 
 use tokio::io::AsyncWriteExt;
@@ -18,6 +19,7 @@ use opcua_types::{Error, SimpleBinaryEncodable, StatusCode};
 
 use super::{
     sequence_number::SequenceNumberHandle,
+    tap::{MessageTap, TapDirection, TappedChunk},
     tcp_types::{AcknowledgeMessage, ErrorMessage},
 };
 
@@ -56,6 +58,8 @@ pub struct SendBuffer {
     pub max_chunk_count: usize,
     /// Maximum size of each individual chunk.
     pub send_buffer_size: usize,
+    /// Optional observer of outgoing plaintext chunks.
+    tap: Option<Arc<dyn MessageTap>>,
 
     state: SendBufferState,
 }
@@ -83,8 +87,15 @@ impl SendBuffer {
             max_message_size,
             max_chunk_count,
             send_buffer_size: buffer_size,
+            tap: None,
             state: SendBufferState::Writing,
         }
+    }
+
+    /// Set a [`MessageTap`] that is shown every chunk just before security is applied to it
+    /// and it is written to the output, or remove it with `None`.
+    pub fn set_message_tap(&mut self, tap: Option<Arc<dyn MessageTap>>) {
+        self.tap = tap;
     }
 
     /// Encode the next chunk in the queue to the out-buffer.
@@ -98,7 +109,16 @@ impl SendBuffer {
         };
 
         let size = match next_chunk {
-            PendingPayload::Chunk(c) => secure_channel.apply_security(&c, self.buffer.get_mut())?,
+            PendingPayload::Chunk(c) => {
+                // The chunk is still plaintext here, and this is the order chunks go on the wire.
+                if let Some(tap) = &self.tap {
+                    match c.chunk_info(secure_channel) {
+                        Ok(info) => tap.on_chunk(&TappedChunk::new(TapDirection::Send, &c, &info)),
+                        Err(e) => trace!("Could not decode outgoing chunk for message tap: {e}"),
+                    }
+                }
+                secure_channel.apply_security(&c, self.buffer.get_mut())?
+            }
             PendingPayload::Ack(a) => {
                 a.encode(&mut self.buffer)?;
                 self.buffer.position() as usize
@@ -347,6 +367,82 @@ mod tests {
         assert!(!buffer.should_encode_chunks());
         assert!(!buffer.can_read());
         assert!(cursor.get_ref().len() > 8196 * 2 && cursor.get_ref().len() < 8196 * 3);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_tap_sees_plaintext_chunks() {
+        use crate::comms::message_chunk::{MessageChunkType, MessageIsFinalType};
+        use crate::comms::tap::{TapDirection, TappedChunk};
+        use std::sync::Mutex;
+
+        // A message that needs three chunks.
+        let message = ReadRequest {
+            request_header: RequestHeader::new(&NodeId::null(), &DateTime::null(), 101),
+            max_age: 0.0,
+            timestamps_to_return: TimestampsToReturn::Both,
+            nodes_to_read: Some(
+                (0..1000)
+                    .map(|r| ReadValueId {
+                        node_id: (1, r).into(),
+                        attribute_id: 1,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        };
+
+        let (mut buffer, channel) = get_buffer_and_channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        buffer.set_message_tap(Some(Arc::new(move |c: &TappedChunk<'_>| {
+            sink.lock().unwrap().push((
+                c.direction,
+                c.message_type,
+                c.is_final,
+                c.sequence_number,
+                c.request_id,
+                c.bytes.len(),
+                c.body.clone(),
+            ));
+        })));
+
+        let m: RequestMessage = message.into();
+        buffer.write(7, m, &channel).unwrap();
+        // Nothing is tapped until a chunk is about to be sent.
+        assert!(seen.lock().unwrap().is_empty());
+
+        let mut wire = Cursor::new(Vec::new());
+        let mut sent_sizes = Vec::new();
+        while buffer.should_encode_chunks() {
+            let before = wire.get_ref().len();
+            buffer.encode_next_chunk(&channel).unwrap();
+            buffer.read_into_async(&mut wire).await.unwrap();
+            sent_sizes.push(wire.get_ref().len() - before);
+        }
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for (i, (direction, message_type, is_final, seq, request_id, len, body)) in
+            seen.iter().enumerate()
+        {
+            assert_eq!(*direction, TapDirection::Send);
+            assert_eq!(*message_type, MessageChunkType::Message);
+            assert_eq!(
+                *is_final,
+                if i == 2 {
+                    MessageIsFinalType::Final
+                } else {
+                    MessageIsFinalType::Intermediate
+                }
+            );
+            // The sequence numbers are the ones that are sent.
+            assert_eq!(*seq, i as u32 + 1);
+            assert_eq!(*request_id, 7);
+            // No security, so the plaintext chunk is the chunk on the wire.
+            assert_eq!(*len, sent_sizes[i]);
+            // message header (12) + symmetric security header (4) + sequence header (8)
+            assert_eq!(body, &(24..*len));
+        }
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use crate::transport::{StreamConnector, StreamTransport};
 
 use super::connect::Connector;
 use super::core::OutgoingMessage;
+use opcua_core::comms::tap::MessageTap;
 use opcua_core::comms::url::is_opc_ua_binary_url;
 use opcua_core::comms::{tcp_codec::TcpCodec, url::hostname_port_from_url};
 use opcua_types::{DecodingOptions, EndpointDescription, Error, StatusCode};
@@ -18,7 +19,7 @@ use tracing::{debug, error, warn};
 /// Type alias for a stream transport over TCP streams.
 pub type TcpTransport = StreamTransport<ReadHalf<TcpStream>, WriteHalf<TcpStream>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// Internal configuration options for transports.
 pub struct TransportConfiguration {
     /// Size of the send buffer in bytes. This is effectively just the
@@ -30,7 +31,29 @@ pub struct TransportConfiguration {
     pub max_message_size: usize,
     /// Maximum number of chunks in a message.
     pub max_chunk_count: usize,
+    /// Optional observer of the plaintext chunks sent and received by the transport.
+    /// Transport implementations that do not use [`StreamConnector`] must
+    /// install it themselves, see [`TransportState::set_message_tap`] and
+    /// [`SendBuffer::set_message_tap`].
+    ///
+    /// [`StreamConnector`]: crate::transport::StreamConnector
+    /// [`TransportState::set_message_tap`]: crate::transport::TransportState::set_message_tap
+    /// [`SendBuffer::set_message_tap`]: opcua_core::comms::buffer::SendBuffer::set_message_tap
+    pub message_tap: Option<Arc<dyn MessageTap>>,
 }
+
+impl std::fmt::Debug for TransportConfiguration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportConfiguration")
+            .field("send_buffer_size", &self.send_buffer_size)
+            .field("recv_buffer_size", &self.recv_buffer_size)
+            .field("max_message_size", &self.max_message_size)
+            .field("max_chunk_count", &self.max_chunk_count)
+            .field("message_tap", &self.message_tap.as_ref().map(|_| "..."))
+            .finish()
+    }
+}
+
 /// Connector for `opc.tcp` transport.
 pub struct TcpConnector {
     endpoint_url: String,
