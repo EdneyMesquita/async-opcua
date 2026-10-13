@@ -66,6 +66,7 @@ tempdir = "0.3"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 env_logger = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
 
 # Include json when building tests

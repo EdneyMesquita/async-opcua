@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Client
+
+#### Fixed
+
+ - Publishing now resumes after a reconnect that recreates the subscriptions, for example after the server restarted. The subscription event loop previously started out believing there were no subscriptions, and ignored publish triggers fired while reconnecting, so it never sent another `Publish` request. ([#270](https://github.com/FreeOpcUa/async-opcua/issues/270))
+
+### Server
+
+#### Fixed
+
+ - `ActivateSession` now returns a random `serverNonce` of at least 32 bytes on all security policies. It was previously empty on `SecurityPolicy::None` channels, which strict clients such as open62541 reject.
+
 ## [0.19.0] - 2026-07-18
 
 A number of smaller fixes, as well as some improvements to codegen, and the release of the `async-opcua-codegen` crate.

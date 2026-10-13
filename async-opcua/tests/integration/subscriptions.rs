@@ -1,6 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use crate::utils::{test_server, ChannelNotifications, TestNodeManager, Tester};
+use futures::StreamExt;
 
 use super::utils::setup;
 use chrono::DateTime;
@@ -16,7 +17,7 @@ use opcua_client::{
     services::{
         CreateMonitoredItems, CreateSubscription, Publish, Republish, TransferSubscriptions,
     },
-    IdentityToken, Subscription, UARequest,
+    IdentityToken, SessionConnectMode, SessionPollResult, Subscription, UARequest,
 };
 use opcua_core_namespace::events::{
     AuditHistoryBulkInsertEventType, AuditSecurityEventType, ProgressEventType,
@@ -1108,6 +1109,149 @@ async fn test_event_subscriptions() {
         Variant::from(DateTime::from_timestamp(10_000, 0).unwrap()),
         evt[3]
     );
+}
+
+/// Regression test for FreeOpcUa/async-opcua#270. After the server is restarted, the session
+/// reconnects with a new session, the subscription is recreated, and publishing
+/// must resume without any manual call to `trigger_publish_now`.
+#[tokio::test]
+async fn publishing_resumes_after_server_restart() {
+    let mut tester = Tester::new(test_server(), false).await;
+    let nm = tester
+        .handle
+        .node_managers()
+        .get_of_type::<TestNodeManager>()
+        .unwrap();
+    let (session, event_loop) = tester.connect_default().await.unwrap();
+
+    // Run the event loop on a task, forwarding poll results so we can observe reconnects.
+    let (poll_tx, mut poll_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn(async move {
+        let stream = event_loop.enter();
+        tokio::pin!(stream);
+        while let Some(r) = stream.next().await {
+            if poll_tx.send(r).is_err() {
+                break;
+            }
+        }
+    });
+    timeout(Duration::from_secs(5), session.wait_for_connection())
+        .await
+        .unwrap();
+
+    fn add_var(tester: &Tester, nm: &TestNodeManager) -> NodeId {
+        let id = nm.inner().next_node_id();
+        nm.inner().add_node(
+            nm.address_space(),
+            tester.handle.type_tree(),
+            VariableBuilder::new(&id, "RestartVar", "RestartVar")
+                .value(0)
+                .data_type(DataTypeId::Int32)
+                .access_level(AccessLevel::CURRENT_READ)
+                .user_access_level(AccessLevel::CURRENT_READ)
+                .build()
+                .into(),
+            &ObjectId::ObjectsFolder.into(),
+            &ReferenceTypeId::Organizes.into(),
+            Some(&VariableTypeId::BaseDataVariableType.into()),
+            Vec::new(),
+        );
+        id
+    }
+
+    let id = add_var(&tester, &nm);
+
+    let (notifs, mut data, _) = ChannelNotifications::new();
+    let sub_id = session
+        .create_subscription(Duration::from_millis(100), 100, 20, 1000, 0, true, notifs)
+        .await
+        .unwrap();
+    let res = session
+        .create_monitored_items(
+            sub_id,
+            TimestampsToReturn::Both,
+            vec![MonitoredItemCreateRequest {
+                item_to_monitor: ReadValueId {
+                    node_id: id.clone(),
+                    attribute_id: AttributeId::Value as u32,
+                    ..Default::default()
+                },
+                monitoring_mode: MonitoringMode::Reporting,
+                requested_parameters: MonitoringParameters {
+                    sampling_interval: 0.0,
+                    queue_size: 10,
+                    discard_oldest: true,
+                    ..Default::default()
+                },
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(res[0].result.status_code, StatusCode::Good);
+
+    // Sanity check, data flows before the restart.
+    let (_, v) = timeout(Duration::from_secs(2), data.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.value, Some(Variant::Int32(0)));
+    nm.set_value(
+        tester.handle.subscriptions(),
+        &id,
+        None,
+        DataValue::new_now(1),
+    )
+    .unwrap();
+    let (_, v) = timeout(Duration::from_secs(2), data.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.value, Some(Variant::Int32(1)));
+
+    // Restart the server. The new server knows nothing about the old session or subscription.
+    tester.restart_server(test_server()).await;
+    let nm = tester
+        .handle
+        .node_managers()
+        .get_of_type::<TestNodeManager>()
+        .unwrap();
+    assert_eq!(add_var(&tester, &nm), id);
+
+    // Wait for the client to reconnect with a new session.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match poll_rx.recv().await.expect("Event loop terminated") {
+                Ok(SessionPollResult::Reconnected(SessionConnectMode::NewSession(_))) => break,
+                Ok(SessionPollResult::Reconnected(m)) => {
+                    panic!("Expected a new session, got {m:?}")
+                }
+                _ => (),
+            }
+        }
+    })
+    .await
+    .expect("Timed out waiting for reconnect");
+
+    // Drain anything delivered so far, e.g. the initial value of the recreated item.
+    while data.try_recv().is_ok() {}
+
+    // Without ever calling `trigger_publish_now`, a changed value must reach the client.
+    // Keep changing the value while we wait, this is a changing variable after all.
+    let handle = tester.handle.clone();
+    let writer = tokio::task::spawn(async move {
+        let mut i = 100;
+        loop {
+            let _ = nm.set_value(handle.subscriptions(), &id, None, DataValue::new_now(i));
+            i += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let res = timeout(Duration::from_secs(5), data.recv()).await;
+    writer.abort();
+    let (_, v) = res
+        .expect("No data change notification after reconnect, publishing did not resume")
+        .unwrap();
+    assert!(matches!(v.value, Some(Variant::Int32(i)) if i >= 100));
 }
 
 // TODO: Add more detailed high level tests on subscriptions.

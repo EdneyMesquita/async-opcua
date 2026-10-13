@@ -72,15 +72,21 @@ impl<T: Future<Output = Result<bool, Error>>, R: Fn() -> T, S: SubscriptionCache
         trigger_publish_recv: tokio::sync::watch::Receiver<Instant>,
         publish_limits_rx: Receiver<PublishLimits>,
         publish_source: R,
-        subscription_cache: S,
+        mut subscription_cache: S,
     ) -> Self {
         let last_external_trigger = *trigger_publish_recv.borrow();
+        // The event loop may be created after subscriptions already exist, for example after
+        // a reconnect where subscriptions were transferred or recreated. In that case any
+        // external trigger fired while connecting predates this loop and is considered
+        // handled by the line above, so we must not start in the "no subscriptions" state,
+        // or we will never publish until some unrelated trigger arrives.
+        let no_active_subscription = subscription_cache.next_publish_time(false).is_none();
         Self {
             last_external_trigger,
             trigger_publish_recv,
             futures: FuturesUnordered::new(),
             waiting_for_response: false,
-            no_active_subscription: true,
+            no_active_subscription,
             publish_limits_rx,
             publish_source,
             subscription_cache,

@@ -490,3 +490,62 @@ async fn issued_token_test() {
         .await
         .unwrap();
 }
+
+/// Part 4 requires the serverNonce returned from ActivateSession to be a random number of
+/// at least 32 bytes, regardless of security policy. Strict clients (open62541) reject
+/// shorter nonces, and on a `None` channel the channel nonce is null.
+#[tokio::test]
+async fn activate_session_server_nonce_on_none_channel() {
+    use opcua_client::{
+        services::{ActivateSession, CreateSession},
+        UARequest,
+    };
+
+    let mut tester = Tester::new(test_server(), false).await;
+    let (session, event_loop) = tester.connect_default().await.unwrap();
+    event_loop.spawn();
+    tokio::time::timeout(Duration::from_secs(5), session.wait_for_connection())
+        .await
+        .unwrap();
+
+    // Create and activate a separate session on the same secure channel, so we can see the
+    // raw responses.
+    let endpoint = session.endpoint_info().endpoint.clone();
+    assert_eq!(
+        endpoint.security_policy_uri.as_ref(),
+        SecurityPolicy::None.to_uri()
+    );
+    let timeout = Duration::from_secs(5);
+    let cert_store = tester.client.certificate_store().clone();
+    let created = CreateSession::new_manual(
+        &cert_store,
+        &endpoint,
+        session.session_id(),
+        timeout,
+        NodeId::null(),
+        session.request_handle(),
+    )
+    .endpoint_url(endpoint.endpoint_url.clone())
+    .session_name("nonce_test")
+    .session_timeout(60_000.0)
+    .send(session.channel())
+    .await
+    .unwrap();
+    assert!(created.server_nonce.len() >= 32);
+
+    let activated = ActivateSession::new_manual(
+        endpoint,
+        session.session_id(),
+        timeout,
+        created.authentication_token.clone(),
+        session.request_handle(),
+    )
+    .send(session.channel())
+    .await
+    .unwrap();
+    assert!(
+        activated.server_nonce.len() >= 32,
+        "ActivateSession server nonce too short: {} bytes",
+        activated.server_nonce.len()
+    );
+}

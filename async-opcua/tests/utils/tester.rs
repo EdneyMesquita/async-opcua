@@ -460,6 +460,40 @@ impl Tester {
         .await
     }
 
+    /// Stop the running server and start a new one, built from `server`, listening on the
+    /// same address. The new server has none of the old server's sessions or subscriptions,
+    /// which is what a client sees when a server process is restarted.
+    #[allow(unused)]
+    pub async fn restart_server(&mut self, server: ServerBuilder) {
+        self.handle.cancel();
+
+        let server = server
+            .pki_dir(format!("./pki-server/{}", self.test_id))
+            .discovery_urls(vec![format!(
+                "opc.tcp://{}:{}",
+                hostname(),
+                self.addr.port()
+            )]);
+        let (server, handle) = server.build().unwrap();
+
+        // The old server needs a moment to shut down and release its port.
+        let mut attempts = 0;
+        let listener = loop {
+            match TcpListener::bind(self.addr).await {
+                Ok(l) => break l,
+                Err(_) if attempts < 100 => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("Failed to rebind server socket: {e}"),
+            }
+        };
+        tokio::task::spawn(server.run_with(listener));
+
+        self._guard = handle.token().clone().drop_guard();
+        self.handle = handle;
+    }
+
     pub fn endpoint(&self) -> String {
         format!("opc.tcp://{}:{}/", hostname(), self.addr.port())
     }
