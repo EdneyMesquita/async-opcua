@@ -524,16 +524,20 @@ impl MonitoredItem {
         }
 
         // If we're outside the sampling interval, keep the value for now,
-        // but shift it to the next sample.
+        // but shift it to the next sample. With the subscription's interval there
+        // is no own interval to shift by: the shift would copy the last sent source
+        // timestamp onto every new value and freeze it, so the value keeps its own.
         if !matches_sampling_interval {
-            value.source_timestamp = self
-                .last_data_value
-                .as_ref()
-                .and_then(|dv| dv.source_timestamp)
-                .unwrap_or(*now)
-                .as_chrono()
-                .checked_add_signed(self.sampling_interval_as_time_delta())
-                .map(|v| v.into());
+            if !matches!(self.sampling_interval, SamplingInterval::Subscription) {
+                value.source_timestamp = self
+                    .last_data_value
+                    .as_ref()
+                    .and_then(|dv| dv.source_timestamp)
+                    .unwrap_or(*now)
+                    .as_chrono()
+                    .checked_add_signed(self.sampling_interval_as_time_delta())
+                    .map(|v| v.into());
+            }
 
             self.sample_skipped_data_value = Some(value);
             // We need to return true here, so that the subscription knows it needs to tick this
@@ -1108,5 +1112,44 @@ pub(super) mod tests {
         assert!(item.maybe_enqueue_skipped_value(&t.into()));
         assert_eq!(item.notification_queue.len(), 1);
         assert!(item.sample_skipped_data_value.is_none());
+    }
+
+    #[test]
+    fn subscription_sampling_keeps_the_source_timestamp() {
+        // A device whose clock is 74 s behind the server: with the subscription's
+        // interval (-1) every notification must carry the value's own source timestamp.
+        let lag = TimeDelta::seconds(74);
+        let start = Utc::now();
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::null(),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::Subscription,
+            true,
+            Some(DataValue::new_at(0, (start - lag).into())),
+        );
+        item.notification_queue.drain(..);
+
+        for i in 1..=5 {
+            let t = start + TimeDelta::milliseconds(500 * i as i64);
+            let source = t - lag;
+            // Between ticks the value is held back...
+            assert!(item.notify_data_value(DataValue::new_at(i, source.into()), &t.into(), false));
+            assert!(item.notification_queue.is_empty());
+            // ...and the tick sends it with the timestamp it came with.
+            assert!(item.maybe_enqueue_skipped_value(&t.into()));
+            let Some(Notification::MonitoredItemNotification(n)) =
+                item.notification_queue.pop_front()
+            else {
+                panic!("Expected a data change on tick {i}");
+            };
+            assert_eq!(n.value.value, Some(Variant::Int32(i)));
+            assert_eq!(n.value.source_timestamp, Some(source.into()));
+        }
     }
 }
